@@ -1,0 +1,11 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+backend = { path = "../" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+dotenvy = "0.15.7"
+polars = { version = "0.44.0", features = ["lazy", "parquet"] }
+regex = "1.10.0"

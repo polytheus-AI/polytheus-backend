@@ -1,0 +1,25 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["benchmark"]
+default-members = ["."]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+dotenvy = "0.15.7"
+polars = { version = "0.44.0", features = ["lazy", "parquet"] }
+regex = "1.10.0"
+image = "0.25.9"
+base64 = "0.22.1"
+
+[profile.dev]
+debug = true
