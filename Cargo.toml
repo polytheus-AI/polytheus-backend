@@ -20,6 +20,10 @@ polars = { version = "0.44.0", features = ["lazy", "parquet"] }
 regex = "1.10.0"
 image = "0.25.9"
 base64 = "0.22.1"
+lambda_http = "1.0.0"
+
+
+
 
 [profile.dev]
 debug = true

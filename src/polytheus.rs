@@ -1,96 +1,216 @@
-use crate::ai_mnemosyne::ai_mnemosyne_impl::{
-    AIMnemosyne, ImageParameterType, PredictionResponse, Provider,
-};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::env;
-use std::io::Write;
+use tokio::time::{sleep, Duration};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum ImageType {
-    Str(String),
-    Vec(Vec<String>),
+mod model;
+use model::{Model, Provider};
+
+mod organization;
+use organization::Organization;
+
+mod licence;
+use licence::Licence;
+
+mod benchmark;
+use benchmark::Benchmark;
+
+/// Build a Replicate prediction request body.
+///
+/// This is intentionally "model-agnostic" and sends OpenAI-like `messages` under `input.messages`,
+/// plus an optional thinking-level property if the model declares one.
+fn build_replicate_request_body(
+    messages: &[Message],
+    thinking_level_property: Option<&str>,
+    thinking_level: Option<&str>,
+    stream: bool,
+) -> Result<Value, String> {
+    let mut body_map = Map::new();
+    body_map.insert("stream".to_string(), json!(stream));
+
+    let mut input_map = Map::new();
+
+    // Convert messages to OpenAI-like format
+    let formatted_messages: Vec<Value> = messages
+        .iter()
+        .map(|msg| {
+            let mut content_list = vec![json!({ "type": "text", "text": msg.input_text })];
+
+            if let Some(img) = &msg.input_image {
+                content_list.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": json!(img)
+                    }
+                }));
+            }
+            if let Some(aud) = &msg.input_audio {
+                content_list.push(json!({
+                    "type": "input_audio",
+                    "inputAudio": {
+                        "data": aud,
+                        "format": msg.input_audio_format.as_deref().unwrap_or("unknown")
+                    }
+                }));
+            }
+            if let Some(vid) = &msg.input_video {
+                content_list.push(json!({
+                    "type": "video_url",
+                    "inputVideo": {
+                        "url": vid
+                    }
+                }));
+            }
+
+            json!({
+                "role": msg.role,
+                "content": content_list
+            })
+        })
+        .collect();
+
+    input_map.insert("messages".to_string(), json!(formatted_messages));
+
+    // Handle thinking level
+    if let (Some(tl_prop), Some(tl)) = (thinking_level_property, thinking_level) {
+        let tl_val = tl.trim();
+        let val = if let Ok(b) = tl_val.parse::<bool>() {
+            Value::Bool(b)
+        } else if let Ok(i) = tl_val.parse::<i64>() {
+            Value::Number(i.into())
+        } else if let Ok(f) = tl_val.parse::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                Value::Number(n)
+            } else {
+                Value::String(tl_val.to_string())
+            }
+        } else {
+            Value::String(tl_val.to_string())
+        };
+        input_map.insert(tl_prop.to_string(), val);
+    }
+
+    body_map.insert("input".to_string(), Value::Object(input_map));
+    Ok(Value::Object(body_map))
 }
 
-impl std::fmt::Display for ImageType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ImageType::Str(s) => write!(f, "{}", s),
-            ImageType::Vec(v) => write!(f, "{:?}", v),
+/// Extract best-effort readable text from a Replicate `output` JSON value.
+fn extract_replicate_output_text(output: &Value) -> String {
+    match output {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                match item {
+                    Value::String(s) => out.push_str(s),
+                    other => out.push_str(&other.to_string()),
+                }
+            }
+            out
         }
+        other => other.to_string(),
     }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PredictionUrls {
+    /// URL used for Server-Sent Events streaming (optional).
+    pub stream: Option<String>,
+
+    /// URL used to fetch the prediction status/result (optional).
+    pub get: Option<String>,
+
+    /// URL used to cancel the prediction (optional).
+    pub cancel: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PredictionResponse {
+    /// Prediction identifier.
+    pub id: Option<String>,
+
+    /// Prediction status (e.g. "starting", "processing", "succeeded", "failed").
+    pub status: Option<String>,
+
+    /// Prediction output; shape is model-dependent.
+    pub output: Option<Value>,
+
+    /// URLs related to this prediction.
+    pub urls: Option<PredictionUrls>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Message {
+    pub role: String,
+    pub input_text: String,
+    pub input_image: Option<String>,
+    pub input_audio: Option<String>,
+    pub input_audio_format: Option<String>,
+    pub input_video: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Polytheus {
-    pub ai_mnemosyne: AIMnemosyne,
+    models: Vec<Model>,
+    organizations: Option<Vec<Organization>>,
+
+    licences: Option<Vec<Licence>>,
+    benchmarks: Vec<Benchmark>,
 }
 
 impl Polytheus {
-    pub fn new() -> Self {
-        Self {
-            ai_mnemosyne: AIMnemosyne::fill(),
+    /// fill Polytheus with all the object obligated to allow Polytheus to work
+    /// that says models and benchmarks
+    pub fn fast_fill() -> Polytheus {
+        Polytheus {
+            models: Model::fill(),
+            organizations: None,
+            licences: None,
+            benchmarks: Benchmark::fill(),
         }
     }
 
-    pub async fn run_a_model(
+    pub async fn run(
         &self,
         model_name: &str,
-        thinking_level: Option<&str>,
-        input_text: &str,
-        input_image: Option<&ImageType /*String*/>,
-        input_audio: Option<&str>,
-        input_audio_format: Option<&str>,
-        input_video: Option<&str>,
+        messages: Vec<Message>,
+        thinking_level: Option<String>,
     ) -> Result<String, String> {
         println!("--- Preparing to run model '{}' ---", model_name);
         // Find the model by name
         let model = self
-            .ai_mnemosyne
             .get_model_by_name(model_name)
             .ok_or_else(|| format!("Model '{}' not found", model_name))?;
 
-        if let Some(image) = input_image {
-            // Check image type compatibility
-            if let Some(expected_type) = model.get_image_parameter_type() {
-                match (expected_type, image) {
-                    (ImageParameterType::String, ImageType::Vec(_)) => {
-                        return Err(format!(
-                                    "Model '{}' expects a single image string, but received a vector of images.",
-                                    model_name
-                                ));
-                    }
-                    (ImageParameterType::VecString, ImageType::Str(_)) => {
-                        return Err(format!(
-                                    "Model '{}' expects a vector of images, but received a single image string.",
-                                    model_name
-                                ));
-                    }
-                    _ => {} // Compatible
+        let client = Client::new();
+
+        // Extract thinking level from the last message if present
+        let thinking_level_property = model.get_thinking_level_property();
+
+        let thinking_levels_authorized = model.get_thinking_levels_authorized();
+        if let Some(tla) = &thinking_levels_authorized {
+            if let Some(tl) = &thinking_level {
+                if !tla.contains(&tl) {
+                    return Err(format!(
+                        "Thinking level '{}' not authorized for model '{}'",
+                        tl, model_name
+                    ));
                 }
             }
         }
 
-        let thinking_level_property = model.get_thinking_level_property();
-
-        // Check thinking level compatibility
-        if let Some(_) = thinking_level {
-            if !model
-                .get_thinking_levels_authorized()
-                .as_ref()
-                .map(|levels| levels.contains(&thinking_level.unwrap_or_default().to_string()))
-                .unwrap_or(false)
-            {
-                return Err(format!(
-                    "thinking level '{}' is not authorized for model '{}'",
-                    thinking_level.unwrap_or_default(),
-                    model_name
-                ));
+        let roles_authorized = model.get_roles_authorized();
+        if let Some(ra) = &roles_authorized {
+            for msg in &messages {
+                if !ra.contains(&msg.role) {
+                    return Err(format!(
+                        "Role '{}' not authorized for model '{}'",
+                        msg.role, model_name
+                    ));
+                }
             }
         }
-
-        let client = Client::new();
 
         match model.get_provider() {
             // code for running the model if it's a replicate model
@@ -99,78 +219,26 @@ impl Polytheus {
                 let api_token = env::var("REPLICATE_API_TOKEN")
                     .map_err(|_| "REPLICATE_API_TOKEN not set".to_string())?;
 
-                println!("--- API Token Retrieved: {} ---", api_token);
+                println!("--- REPLICATE_API_TOKEN retrieved ---");
 
                 let url = &model.get_apiurl();
 
                 println!("--- API URL Retrieved: {} ---", url);
 
-                // Create a mutable JSON map
-                let mut map = Map::new();
-
-                // Insert dynamic key-value pair
-                map.insert(
-                    thinking_level_property.unwrap_or_default().to_string(),
-                    json!(thinking_level.unwrap_or_default()),
-                );
-
-                // Convert map into JSON value
-                let thinking = Value::Object(map);
-
-                println!("{}", thinking);
-
-                // Build the request body as a JSON object and conditionally include the thinking field.
-                let mut body_map = Map::new();
-                body_map.insert("stream".to_string(), json!(true));
-                let mut input_map = Map::new();
-                input_map.insert("prompt".to_string(), json!(input_text.to_string()));
-                if let Some(image) = input_image {
-                    let val = match image {
-                        ImageType::Str(s) => json!(s),
-                        ImageType::Vec(v) => json!(v),
-                    };
-                    println!("grosse pute {}", val);
-                    input_map.insert(model.get_image_parameters().unwrap().to_string(), val);
-                }
-
-                if input_audio.is_some() {
-                    input_map.insert("audio".to_string(), json!(input_audio.unwrap()));
-                }
-                if input_video.is_some() {
-                    input_map.insert("video".to_string(), json!(input_video.unwrap()));
-                }
-                if thinking_level.is_some() && thinking_level_property.is_some() {
-                    {
-                        let prop = thinking_level_property.unwrap();
-                        let tl = thinking_level.unwrap_or_default().trim();
-                        // Try bool -> int -> float -> fallback to string
-                        let val = if let Ok(b) = tl.parse::<bool>() {
-                            Value::Bool(b)
-                        } else if let Ok(i) = tl.parse::<i64>() {
-                            Value::Number(i.into())
-                        } else if let Ok(f) = tl.parse::<f64>() {
-                            if let Some(n) = serde_json::Number::from_f64(f) {
-                                Value::Number(n)
-                            } else {
-                                Value::String(tl.to_string())
-                            }
-                        } else {
-                            Value::String(tl.to_string())
-                        };
-                        input_map.insert(prop.to_string(), val);
-                    }
-                }
-
-                body_map.insert("input".to_string(), Value::Object(input_map));
-
-                let body = Value::Object(body_map);
+                // Default behavior: non-streaming (poll the prediction "get" URL and return a normal response).
+                let body = build_replicate_request_body(
+                    &messages,
+                    thinking_level_property,
+                    thinking_level.as_deref(),
+                    false,
+                )?;
 
                 println!("request body: {}", body);
 
                 // 4. POST Request to get the stream_url
                 let response = client
                     .post(*url)
-                    .header("Authorization", format!("Bearer {}", &api_token))
+                    .header("Authorization", format!("Bearer {}", api_token))
                     .json(&body)
                     .send()
                     .await
@@ -196,108 +264,88 @@ impl Polytheus {
                     .json()
                     .await
                     .map_err(|e| format!("Failed to parse prediction response: {}", e))?;
-                let stream_url = prediction.urls.stream;
 
-                // The equivalent of 'jq -r .urls.stream' is done by the serde deserialization above
-                println!("--- Stream URL Retrieved: {} ---", stream_url);
-
-                // 6. GET Request to the stream URL (Server-Sent Events)
-                let mut stream_response = client
-                    .get(&stream_url)
-                    .header("Accept", "text/event-stream")
-                    .header("Cache-Control", "no-store")
-                    .header("Authorization", format!("Bearer {}", api_token)) // Optional, but good practice
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to send stream request: {}", e))?;
-
-                println!("--- Stream Response Received ---");
-
-                let stream_status = stream_response.status();
-                if stream_status != StatusCode::OK {
-                    let error_text = stream_response
-                        .text()
-                        .await
-                        .map_err(|e| format!("error reading stream error body: {}", e))?;
-                    return Err(format!(
-                        "Stream API call failed with status: {} and body: {}",
-                        stream_status, error_text
-                    ));
+                // If Replicate already returned an output (rare for async predictions), return it.
+                if let Some(output) = prediction.output.as_ref() {
+                    return Ok(extract_replicate_output_text(output));
                 }
 
-                // 7. Process the SSE stream chunk by chunk; parse events and stop on "done"
-                // Accumulate partial chunks into `buffer` because SSE messages can be split across chunks.
-                let mut buffer = String::new();
+                // Poll the prediction "get" URL until it succeeds.
+                let get_url = prediction
+                    .urls
+                    .as_ref()
+                    .and_then(|u| u.get.as_deref())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        prediction
+                            .id
+                            .as_deref()
+                            .map(|id| format!("https://api.replicate.com/v1/predictions/{}", id))
+                    })
+                    .ok_or_else(|| {
+                        "Replicate prediction response missing urls.get and id".to_string()
+                    })?;
+
+                let timeout = Duration::from_secs(120);
+                let mut delay = Duration::from_millis(200);
+                let start = std::time::Instant::now();
+
                 loop {
-                    let opt_chunk = stream_response
-                        .chunk()
+                    if start.elapsed() > timeout {
+                        return Err(format!(
+                            "Replicate prediction timed out after {:?}",
+                            timeout
+                        ));
+                    }
+
+                    let poll_resp = client
+                        .get(&get_url)
+                        .header("Authorization", format!("Bearer {}", api_token))
+                        .send()
                         .await
-                        .map_err(|e| format!("Stream chunk error: {}", e))?;
+                        .map_err(|e| format!("Failed to poll prediction: {}", e))?;
 
-                    let chunk = match opt_chunk {
-                        Some(c) => c,
-                        None => break, // connection closed
-                    };
+                    let poll_status = poll_resp.status();
+                    if !poll_status.is_success() {
+                        let error_text = poll_resp
+                            .text()
+                            .await
+                            .map_err(|e| format!("error reading poll error body: {}", e))?;
+                        return Err(format!(
+                            "Replicate poll failed with status: {} and body: {}",
+                            poll_status, error_text
+                        ));
+                    }
 
-                    // Append received bytes (lossy) to the buffer
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let poll_json: Value = poll_resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("Failed to parse poll response JSON: {}", e))?;
 
-                    // Try to extract full events separated by empty line (handle both CRLF and LF)
-                    loop {
-                        // find earliest double-newline separator (CRLF or LF)
-                        let sep_pos = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"));
+                    let status_str = poll_json
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
 
-                        if sep_pos.is_none() {
-                            break; // no full event yet
+                    match status_str {
+                        "succeeded" => {
+                            let output = poll_json.get("output").ok_or_else(|| {
+                                format!("Replicate succeeded but missing output: {}", poll_json)
+                            })?;
+                            return Ok(extract_replicate_output_text(output));
                         }
-                        let idx = sep_pos.unwrap();
-                        let event_block = buffer[..idx].to_string();
-                        // remove processed block + separator from buffer
-                        // handle either CRLF or LF length
-                        if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
-                            buffer = buffer[idx + 4..].to_string();
-                        } else {
-                            buffer = buffer[idx + 2..].to_string();
+                        "failed" | "canceled" => {
+                            return Err(format!(
+                                "Replicate prediction {}: {}",
+                                status_str, poll_json
+                            ));
                         }
-
-                        // Parse the event block
-                        let mut event_type: Option<String> = None;
-                        let mut data_lines: Vec<String> = Vec::new();
-                        for line in event_block.lines() {
-                            if let Some(rest) = line.strip_prefix("event:") {
-                                event_type = Some(rest.trim().to_string());
-                            } else if let Some(rest) = line.strip_prefix("data:") {
-                                data_lines.push(rest.trim().to_string());
-                            }
-                        }
-
-                        let data = data_lines.join("\n");
-
-                        // If the provider signals done, finish the stream handling immediately.
-                        if event_type.as_deref() == Some("done") {
-                            // Optionally print any final data (often `{}`) before returning.
-                            if !data.is_empty() && data != "{}" {
-                                print!("{}", data);
-                                std::io::stdout()
-                                    .flush()
-                                    .map_err(|e| format!("Stdout flush error: {}", e))?;
-                            }
-                            println!("\n--- Stream 'done' event received ---");
-                            return Ok(format!("Stream finished for model '{}'", model_name));
-                        }
-
-                        // For other events (or absent event field), print data if present.
-                        if !data.is_empty() && data != "{}" {
-                            print!("{}", data);
-                            std::io::stdout()
-                                .flush()
-                                .map_err(|e| format!("Stdout flush error: {}", e))?;
+                        _ => {
+                            sleep(delay).await;
+                            delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                         }
                     }
                 }
-                // If we exit the read loop without receiving a "done" event, treat it as finished.
-                println!("\n--- Stream Finished (connection closed) ---");
-                return Ok(format!("Stream finished for model '{}'", model_name));
             }
             // code for running the model if it's an openrouter model
             Provider::OpenRouter => {
@@ -313,86 +361,74 @@ impl Polytheus {
                 // in model.apiurl or model.name; adapt this as needed:
                 let model_id = model.get_apiurl();
 
-                // Build the messages payload: here we send a single user message containing a text content.
-                // If you want to send images, you can push another content item with type = "image_url".
-                let mut content_list =
-                    vec![serde_json::json!({ "type": "text", "text": input_text })];
+                // Build the messages payload
+                let formatted_messages: Vec<Value> = messages
+                    .iter()
+                    .map(|msg| {
+                        let mut content_list =
+                            vec![json!({ "type": "text", "text": msg.input_text })];
 
-                if let Some(img) = input_image {
-                    content_list.push(serde_json::json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": match img {
-                                ImageType::Str(s) => json!(s),
-                                ImageType::Vec(v) => json!(v),
-                            }
+                        if let Some(img) = &msg.input_image {
+                            content_list.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": img
+                                }
+                            }));
                         }
-                    }));
-                }
-
-                if let Some(aud) = input_audio {
-                    content_list.push(serde_json::json!({
-                        "type": "input_audio",
-                        "inputAudio": {
-                            "data": aud,
-                            "format": input_audio_format.unwrap_or("unknown")
+                        if let Some(aud) = &msg.input_audio {
+                            content_list.push(json!({
+                                "type": "input_audio",
+                                "inputAudio": {
+                                    "data": aud,
+                                    "format": msg.input_audio_format.as_deref().unwrap_or("unknown")
+                                }
+                            }));
                         }
-                    }));
-                }
-
-                if let Some(vid) = input_video {
-                    content_list.push(serde_json::json!({
-                        "type": "video_url",
-                        "inputVideo": {
-                            "url": vid
+                        if let Some(vid) = &msg.input_video {
+                            content_list.push(json!({
+                                "type": "video_url",
+                                "inputVideo": {
+                                    "url": vid
+                                }
+                            }));
                         }
-                    }));
-                }
 
-                let messages = vec![serde_json::json!({
-                    "role": "user",
-                    "content": content_list
-                })];
+                        Ok(json!({
+                            "role": msg.role,
+                            "content": content_list
+                        }))
+                    })
+                    .collect::<Result<Vec<Value>, String>>()?;
 
-                // Create a mutable JSON map
-                let mut map = Map::new();
+                println!("OpenRouter formatted messages: {:?}", formatted_messages);
 
-                // Insert dynamic key-value pair
-                map.insert(
-                    thinking_level_property.unwrap_or_default().to_string(),
-                    json!(thinking_level.unwrap_or_default()),
-                );
-
-                // Convert map into JSON value
-                let thinking = Value::Object(map);
-
-                println!("{}", thinking);
-
-                // Build the request body as a JSON object and conditionally include the thinking field.
+                // Build the request body
                 let mut body_map = Map::new();
                 body_map.insert("model".to_string(), json!(model_id));
-                body_map.insert("messages".to_string(), json!(messages));
-                if thinking_level.is_some() && thinking_level_property.is_some() {
-                    {
-                        let prop = thinking_level_property.unwrap();
-                        let tl = thinking_level.unwrap_or_default().trim();
-                        // Try bool -> int -> float -> fallback to string
-                        let val = if let Ok(b) = tl.parse::<bool>() {
+                body_map.insert("messages".to_string(), json!(formatted_messages));
+
+                // Handle thinking level
+                if let Some(tl_prop) = thinking_level_property {
+                    if let Some(tl) = &thinking_level {
+                        let tl_val = tl.trim();
+                        let val = if let Ok(b) = tl_val.parse::<bool>() {
                             Value::Bool(b)
-                        } else if let Ok(i) = tl.parse::<i64>() {
+                        } else if let Ok(i) = tl_val.parse::<i64>() {
                             Value::Number(i.into())
-                        } else if let Ok(f) = tl.parse::<f64>() {
+                        } else if let Ok(f) = tl_val.parse::<f64>() {
                             if let Some(n) = serde_json::Number::from_f64(f) {
                                 Value::Number(n)
                             } else {
-                                Value::String(tl.to_string())
+                                Value::String(tl_val.to_string())
                             }
                         } else {
-                            Value::String(tl.to_string())
+                            Value::String(tl_val.to_string())
                         };
-                        body_map.insert(prop.to_string(), val);
+                        body_map.insert(tl_prop.to_string(), val);
                     }
                 }
+
                 let body = Value::Object(body_map);
 
                 println!("OpenRouter request body: {}", body);
@@ -500,5 +536,68 @@ impl Polytheus {
                 return Ok(result_text);
             }
         }
+    }
+
+    /// getter for the model by its name
+    pub fn get_model_by_name(&self, model_name: &str) -> Option<&Model> {
+        self.models
+            .iter()
+            .find(|model| model.get_name() == model_name)
+    }
+
+    /// getter for the benchmark by its name
+    pub fn get_benchmark_by_name(&self, benchmark_name: &str) -> Option<&Benchmark> {
+        self.benchmarks
+            .iter()
+            .find(|benchmark| benchmark.get_name() == benchmark_name)
+    }
+}
+
+#[cfg(test)]
+mod replicate_non_stream_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_build_replicate_request_body_stream_flag_false() {
+        let start = Instant::now();
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            input_text: "hello".to_string(),
+            input_image: None,
+            input_audio: None,
+            input_audio_format: None,
+            input_video: None,
+        }];
+
+        let body = build_replicate_request_body(&messages, None, None, false).unwrap();
+        assert_eq!(body.get("stream").and_then(|v| v.as_bool()), Some(false));
+
+        let duration = Instant::now() - start;
+        eprintln!(
+            "test_build_replicate_request_body_stream_flag_false took: {:?}",
+            duration
+        );
+    }
+
+    #[test]
+    fn test_extract_replicate_output_text_string_and_array() {
+        let start = Instant::now();
+
+        let s = Value::String("abc".to_string());
+        assert_eq!(extract_replicate_output_text(&s), "abc".to_string());
+
+        let a = Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        assert_eq!(extract_replicate_output_text(&a), "ab".to_string());
+
+        let duration = Instant::now() - start;
+        eprintln!(
+            "test_extract_replicate_output_text_string_and_array took: {:?}",
+            duration
+        );
     }
 }

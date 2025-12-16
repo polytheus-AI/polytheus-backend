@@ -1,15 +1,17 @@
-use backend::polytheus::ImageType;
 use backend::polytheus::Polytheus;
 use dotenvy::dotenv;
+
+use backend::hosting_method::aws_lambda;
+use lambda_http::{run, service_fn, tracing, Error};
 
 use base64::prelude::*;
 use std::io::Read;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Error> {
     dotenv().ok();
 
-    let image_path = "media/test/Sagrada_Familia.jpg";
+    /*let image_path = "media/test/Sagrada_Familia.jpg";
     println!("image_path: {}", image_path);
     let mut file = std::fs::File::open(image_path).expect("Failed to open image file");
     let mut buffer = Vec::new();
@@ -34,5 +36,7 @@ async fn main() {
     {
         Ok(result) => println!("Model output: {}", result),
         Err(e) => eprintln!("Error: {}", e),
-    }
+    }*/
+
+    aws_lambda::run().await
 }

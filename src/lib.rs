@@ -1,3 +1,3 @@
-pub mod ai_mnemosyne;
-pub mod open_ai_api;
+pub mod api;
+pub mod hosting_method;
 pub mod polytheus;

@@ -104,10 +104,19 @@ impl<'a> Benchmark<'a> {
             };
 
             // Run the model to get the answer
-            let model_response = match polytheus
-                .run_a_model(&model, None, &question, None, None, None, None) // Assuming no specific thinking level for now
-                .await
-            {
+
+            let message = backend::polytheus::Message {
+                thinking_level: None,
+                input_text: question.clone(),
+                input_image: None,
+                input_audio: None,
+                input_audio_format: None,
+                input_video: None,
+            };
+            let messages = vec![message];
+
+            // Run the model to get the answer
+            let model_response = match polytheus.run(&model, messages, None).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("Error running model {}: {}", model, e);
@@ -128,10 +137,19 @@ impl<'a> Benchmark<'a> {
             println!("Judge input: {}", judge_input);
 
             // Run the judge model
-            let judge_response = match polytheus
-                .run_a_model(&model_judge, None, &judge_input, None, None, None, None)
-                .await
-            {
+
+            let message = backend::polytheus::Message {
+                thinking_level: None,
+                input_text: judge_input,
+                input_image: None,
+                input_audio: None,
+                input_audio_format: None,
+                input_video: None,
+            };
+            let messages = vec![message];
+
+            // Run the judge model
+            let judge_response = match polytheus.run_llm(&model_judge, messages, None).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("Error running judge model {}: {}", model_judge, e);
